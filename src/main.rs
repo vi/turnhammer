@@ -8,6 +8,7 @@ extern crate futures;
 extern crate tokio;
 extern crate fibers;
 extern crate fibers_transport;
+extern crate bytecodec;
 
 
 use std::net::SocketAddr;
@@ -29,9 +30,15 @@ use std::net::ToSocketAddrs;
 use stun_codec::rfc5389;
 use stun_codec::{MessageDecoder, MessageEncoder};
 
+use bytecodec::{DecodeExt, EncodeExt};
+use stun_codec::{Message, MessageClass, TransactionId};
+use stun_codec::rfc5389::{methods::BINDING, Attribute};
+use stun_codec::rfc5389::attributes::{Software,XorMappedAddress};
+
+
 #[derive(Debug, StructOpt)]
 struct Opt {
-    /// STUN server address.
+    /// TURN server address.
     #[structopt(long = "server", default_value = "127.0.0.1:3478")]
     server: SocketAddr,
 
@@ -47,7 +54,40 @@ struct Opt {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
 
+    let local_addr : SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let udp = std::net::UdpSocket::bind(local_addr)?;
+
+    
+    let mut message = Message::new(
+        MessageClass::Request,
+        BINDING,
+        TransactionId::new([3; 12])
+    );
+    message.add_attribute(Attribute::Software(Software::new("TURN_Hammer".to_owned())?));
+
+    // Encodes the message
+    let mut encoder = MessageEncoder::new();
+    let bytes = encoder.encode_into_bytes(message.clone())?;
+
+    udp.send_to(&bytes[..], opt.server)?;
+
+    let mut buf = [0; 1024];
+    let (len, addr) = udp.recv_from(&mut buf[..])?;
+    let buf = &buf[0..len];
+
+    //eprintln!("Received reply from {:?}", addr);
+
+    let mut decoder = MessageDecoder::<Attribute>::new();
+    let decoded = decoder.decode_from_bytes(buf)?.map_err(|_|format!("Broken STUN reply"))?;
+    
+    //eprintln!("Decoded message: {:?}", decoded);
+    let external_addr : &XorMappedAddress = decoded.get_attribute().ok_or_else(||format!("No XorMappedAddress?"))?;
+    let external_addr = external_addr.address();
+
+    println!("{}", external_addr);
+
     //let mut rt = tokio::runtime::current_thread::Runtime::new()?;
+    /*
     let mut rt = fibers::executor::InPlaceExecutor::new()?;
     let h = rt.handle();
 
@@ -69,6 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr : &rfc5389::attributes::XorMappedAddress = response.get_attribute().ok_or_else(||format!("No XorMappedAddr?"))?;
     let addr = addr.address();
     eprintln!("STUN response: {:?}", addr);
+    */
+
 
 
     /*
