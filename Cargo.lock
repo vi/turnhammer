@@ -873,10 +873,13 @@ dependencies = [
 name = "turnhammer"
 version = "0.1.0"
 dependencies = [
+ "fibers 0.1.12 (registry+https://github.com/rust-lang/crates.io-index)",
+ "fibers_transport 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.1.25 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustun 0.3.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "rusturn 0.0.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "structopt 0.2.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "stun_codec 0.1.10 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio 0.1.15 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
