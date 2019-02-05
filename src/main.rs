@@ -1,30 +1,22 @@
 #![allow(unused)]
 
 extern crate bytecodec;
-extern crate fibers;
-extern crate fibers_transport;
 extern crate futures;
 extern crate rand;
-extern crate rustun;
-extern crate rusturn;
 extern crate structopt;
 extern crate stunclient;
+extern crate turnclient;
 extern crate tokio;
+extern crate spin_sleep;
+extern crate tokio_timer;
 
+use std::time::{Duration,Instant};
 use std::net::SocketAddr;
 use structopt::StructOpt;
 
-use fibers::{Executor, Spawn};
-use fibers_transport::UdpTransporter;
 use futures::{Async, Future, Poll};
-use rusturn::auth::AuthParams;
-use rusturn::client::{wait, Client as TurnClient, UdpClient as TurnUdpClient};
-use rusturn::Error;
+use futures::{Stream, Sink};
 
-use rustun::channel::Channel;
-use rustun::client::Client as StunClient;
-use rustun::message::Request;
-use rustun::transport::StunUdpTransporter;
 use std::net::ToSocketAddrs;
 use stun_codec::rfc5389;
 use stun_codec::{MessageDecoder, MessageEncoder};
@@ -36,67 +28,151 @@ use stun_codec::rfc5389::attributes::{
 use stun_codec::rfc5389::{methods::BINDING, Attribute};
 use stun_codec::{Message, MessageClass, TransactionId};
 
+use tokio::sync::oneshot;
+
+type Error = Box<dyn std::error::Error>;
+
+
 #[derive(Debug, StructOpt)]
 struct Opt {
-    /// TURN server address.
-    #[structopt(long = "server", default_value = "127.0.0.1:3478")]
+    /// TURN server address (hostname is not resolved)
     server: SocketAddr,
 
-    /// Username.
-    #[structopt(long = "username", default_value = "foo")]
+    /// Username for TURN authorization
     username: String,
 
-    /// Password.
-    #[structopt(long = "password", default_value = "bar")]
+    /// Credential for TURN authorizaion
     password: String,
+
+    /// Number of simultaneous connections
+    #[structopt(short="-j", long="parallel-connections", default_value="1")]
+    num_connections: u64,
+
+    /// Packet size
+    #[structopt(short="-s", long="pkt-size", default_value="100")]
+    packet_size: usize,
+
+    /// Packets per second
+    #[structopt(long="pps", default_value="5")]
+    delay_between_packets: u32,
+
+    /// Experiment duration, seconds
+    #[structopt(short="d", long="duration", default_value="5")]
+    duration: u64,
+
+    /// Seconds to wait and receive after stopping sender
+    #[structopt(long="delay-after-stopping-sender", default_value="3")]
+    delay_after_stopping_sender: u64,
+
+    /// Microseconds to wait between TURN allocations
+    #[structopt(long="delay-between-allocations", default_value="2000")]
+    delay_between_allocations: u64,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+enum ServeTurnEventOrShutdown {
+    TurnEvent(turnclient::MessageFromTurnServer),
+    Shutdown,
+}
+
+fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
 
     let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let udp = std::net::UdpSocket::bind(local_addr)?;
+    let probing_udp = std::net::UdpSocket::bind(local_addr)?;
 
+    // Phase 1: Query my own external address
     let extaddr = stunclient::StunClient::new(opt.server)
         .set_software(Some("TURN_hammer"))
-        .query_external_address(&udp)?;
-    eprintln!("External address: {}", extaddr);
+        .query_external_address(&probing_udp)?;
+    eprintln!("My external address: {}", extaddr);
 
-    //let mut rt = tokio::runtime::current_thread::Runtime::new()?;
-    /*
-    let mut rt = fibers::executor::InPlaceExecutor::new()?;
-    let h = rt.handle();
+    // Phase 2: Allocate K instances of a TURN client
 
-    let auth_params = AuthParams::new(&opt.username, &opt.password)?;
+    let k = opt.num_connections;
+    let duration = opt.duration;
+    let delay_after_stopping_sender = opt.delay_after_stopping_sender;
 
-    let local_addr = "0.0.0.0:0".parse().unwrap();
-    let response = UdpTransporter::<MessageEncoder<_>, MessageDecoder<_>>::bind(local_addr)
-        .map_err(Error::from)
-        .map(StunUdpTransporter::new)
-        .map(Channel::new)
-        .and_then(move |channel| {
-            let h = h;
-            let client = StunClient::new(&h, channel);
-            let request = Request::<rfc5389::Attribute>::new(rfc5389::methods::BINDING);
-            client.call(opt.server, request)
-        });
-    let monitor = rt.spawn_monitor(response);
-    let response = rt.run_fiber(monitor)??.map_err(|e|format!("{:?}",e))?;
-    let addr : &rfc5389::attributes::XorMappedAddress = response.get_attribute().ok_or_else(||format!("No XorMappedAddr?"))?;
-    let addr = addr.address();
-    eprintln!("STUN response: {:?}", addr);
-    */
-
-    /*
-    let client = TurnUdpClient::allocate(
-        opt.server,
-        auth_params
+    let clientstream = futures::stream::repeat::<_,Error>(
+        (opt.server, opt.username, opt.password),
     );
-    let mut monitor = rt.spawn_monitor(client);
-    let client = rt.run_fiber(monitor)??;
+    let clientstream = clientstream.take(k);
+    let clientstream = tokio_timer::throttle::Throttle::new(
+        clientstream,
+        Duration::from_micros(opt.delay_between_allocations),
+    );
+    let clientstream = clientstream.map_err(|e|Error::from("Error throttling"));
 
-    eprintln!("{:?}", client.relay_addr());
-    */
+    let clienthandles = clientstream.map(move |(serv, user, passwd)| {
+        let (snd, rcv) = oneshot::channel::<SocketAddr>();
+        let (snd2, rcv2) = oneshot::channel::<()>(); // for shutdown
+        let mut snd = Some(snd);
+        let rcv2 = rcv2.map_err(|_|Error::from("Oneshot error 2"));
+
+        use turnclient::{MessageFromTurnServer,MessageToTurnServer,ChannelUsage};
+
+        let udp = tokio::net::UdpSocket::bind(&local_addr).expect("Can't bind UDP anymore");
+        let mut c = turnclient::TurnClientBuilder::new(serv, user, passwd);
+        c.max_retries = 30;
+        let (turnsink, turnstream) = c.build_and_send_request(udp).split();
+
+        let srcevents = turnstream.map(|x|ServeTurnEventOrShutdown::TurnEvent(x))
+        .select(rcv2.into_stream().map(|()|ServeTurnEventOrShutdown::Shutdown));
+
+        use MessageFromTurnServer::*;
+        use ServeTurnEventOrShutdown::*;
+
+        let f = srcevents.map(move |x| {
+            match x {
+                TurnEvent(AllocationGranted{relay_address, ..}) => {
+                    snd.take().expect("More than one AllocationGranted?").send(relay_address);
+                    MessageToTurnServer::AddPermission(extaddr, ChannelUsage::WithChannel)
+                },
+                TurnEvent(MessageFromTurnServer::RecvFrom(sa,data)) => {
+                    //eprintln!("Incoming {} bytes from {}", data.len(), sa);
+                    MessageToTurnServer::SendTo(sa, data)
+                },
+                Shutdown => {
+                    MessageToTurnServer::Disconnect
+                },
+                _ => MessageToTurnServer::Noop,
+            }
+        }).forward(turnsink)
+        .and_then(|(_turnstream,_turnsink)|{
+            futures::future::ok(())
+        })
+        .map_err(|e|eprintln!("{}", e));
+
+        tokio::runtime::current_thread::spawn(f);
+        (rcv, snd2)
+    });
+    let clienthandles = clienthandles.collect();
+    let clienthandles = clienthandles.and_then(move |x|{
+        let (init_handles, shutdown_handles) : (Vec<_>, Vec<_>) = x.into_iter().unzip();
+        futures::future::join_all(init_handles)
+        .and_then(|h| {
+            eprintln!("Allocated {} TURN clients", h.len());
+            futures::future::ok(())
+        })
+        .map_err(|_e|Error::from("Oneshot error"))
+        .and_then(move |()| {
+            tokio_timer::Delay::new(
+                Instant::now() + 
+                Duration::from_secs(
+                    duration + delay_after_stopping_sender
+                )
+            ).and_then(|()| {
+                eprintln!("Stopping TURN clients");
+                for sh in shutdown_handles {
+                    sh.send(());
+                }
+                futures::future::ok(())
+            }).map_err(|_e|Error::from("Timer error"))
+        })
+    });
+
+    let f = clienthandles.map_err(|e|eprintln!("{}",e));
+
+    tokio::runtime::current_thread::run(f);
 
     Ok(())
 }
