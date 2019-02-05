@@ -69,6 +69,14 @@ struct Opt {
     /// Microseconds to wait between TURN allocations
     #[structopt(long="delay-between-allocations", default_value="2000")]
     delay_between_allocations: u64,
+
+    /// Don't actually run, only calculate bandwidth and traffic
+    #[structopt(long="calc")]
+    only_calc: bool,
+
+    /// Override bandwidth or traffic limitation
+    #[structopt(long="force", short="f")]
+    force: bool,
 }
 
 enum ServeTurnEventOrShutdown {
@@ -121,20 +129,184 @@ fn receiving_thread(
     udp: Arc<std::net::UdpSocket>,
     duration_seconds: u64,
     packet_size: usize,
+    total_packets: u64,
     time_base: Instant,
 ) {
+    use std::collections::BinaryHeap;
+    use byteorder::{BE,ByteOrder};
+
+    #[derive(PartialEq,Eq)]
+    struct Packet {
+        no: u32,
+        rtt4: Duration,
+    }
+    /// Compare by `no` field, reversed
+    impl Ord for Packet {
+        fn cmp(&self, other: &Packet) -> std::cmp::Ordering {
+            other.no.cmp(&self.no)
+        }
+    }
+    impl PartialOrd for Packet {
+        fn partial_cmp(&self, other: &Packet) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut jitter_buffer = BinaryHeap::with_capacity(1024);
+
+    let deadline = Instant::now() + Duration::from_secs(duration_seconds);
+
+    let mut min_n = std::u32::MAX;
+    let mut max_n = std::u32::MIN;
+    
+    let mut ctr = 0;
+    let mut prevn = std::u32::MAX;
+    let mut badloss = 0;
+    let mut dup = 0;
+    let mut rtt4stats = [0; 6];
+
+    let mut received_something = false;
+
+    let mut analyse_packet = |p:&Packet| {
+        //eprintln!("no={}", p.no);
+        if min_n > p.no { min_n = p.no }
+        if max_n < p.no { max_n = p.no }
+        
+        if p.no == prevn {
+            // duplicate packet, ignore
+            dup+=1;
+            return;
+        }
+
+        
+        if p.no > prevn && p.no - prevn > 50 {
+             badloss += p.no - prevn;
+        }
+
+        if p.rtt4 < Duration::from_millis(50) {
+            rtt4stats[0]+=1;
+        } else if p.rtt4 < Duration::from_millis(180) {
+            rtt4stats[1]+=1;
+        } else if p.rtt4 < Duration::from_millis(400) {
+            rtt4stats[2]+=1;
+        } else if p.rtt4 < Duration::from_millis(1000) {
+            rtt4stats[3]+=1;
+        } else if p.rtt4 < Duration::from_millis(2000) {
+            rtt4stats[4]+=1;
+        } else {
+            rtt4stats[5]+=1;
+        }
+
+        ctr+=1;
+        prevn = p.no;
+    };
+
     let mut buf = vec![0; packet_size];
     loop {
-        let (_len, _addr) = udp.recv_from(&mut buf[..]).expect("Failed to receive packet");
-        println!("Received a packet from {}", _addr);
+        let ret = udp.recv_from(&mut buf[..]);
+        let now = Instant::now();
+        if now > deadline {
+            break;
+        }
+        if let Ok((_len, _addr)) = ret {
+            //println!("Received a packet from {}", _addr);
+
+            let s = BE::read_u64(&mut buf[0..8]);
+            let ns= BE::read_u32(&mut buf[8..12]);
+            let no= BE::read_u32(&mut buf[12..16]);
+
+            let since_base = Duration::new(s,ns);
+            let send_time = time_base + since_base;
+            let rtt4 = if now >= send_time { now - send_time } else { Duration::from_secs(999)};
+            jitter_buffer.push(Packet {
+                no,
+                rtt4,
+            });
+            if jitter_buffer.len() > 1022 {
+                analyse_packet(&jitter_buffer.pop().unwrap());
+            };
+
+            if !received_something {
+                received_something = true;
+                eprintln!("Received the first datagram");
+            }
+
+        } else {
+            // don't care
+        }
     }
+    while let Some(p) = jitter_buffer.pop() {
+        analyse_packet(&p);
+    }
+    drop(analyse_packet);
+
+    if ctr == 0 {
+        println!("Received no packets");
+        return;
+    }
+    let nn = (max_n - min_n + 1);
+
+    print!(
+        "Received {} packets from {} window of total {} || ",
+        ctr,
+        nn,
+        total_packets,
+    );
+    let nn = nn as f64;
+    let loss = 100.0 - (ctr as f64) * 100.0 / nn;
+    let badl = (badloss as f64) * 100.0 / nn;
+    let rtts0 =(rtt4stats[0] as f64) * 100.0 / nn;
+    let rtts1 =(rtt4stats[1] as f64) * 100.0 / nn;
+    let rtts2 =(rtt4stats[2] as f64) * 100.0 / nn;
+    let rtts3 =(rtt4stats[3] as f64) * 100.0 / nn;
+    let rtts4 =(rtt4stats[4] as f64) * 100.0 / nn;
+    let rtts5 =(rtt4stats[5] as f64) * 100.0 / nn;
+    println!(
+        "Loss: {:07.04}%   bad loss: {:07.04}%",
+        loss,
+        badloss,
+    );
+    println!(
+        "RTT4 brackets: 0-49ms: {:07.04}%   180-399ms: {:07.04}%  1000-1999ms: {:07.04}%",
+        rtts0,
+        rtts2,
+        rtts4,
+    );
+    println!(
+        "             50-179ms: {:07.04}%   500-999ms: {:07.04}%      2000+ms: {:07.04}%",
+        rtts1,
+        rtts3,
+        rtts5,
+    );
+    let overall = 10.0 - loss/10.0 - badl/5.0 - rtts2/70.0 - rtts3/40.0 - rtts4/30.0 - rtts5/20.0;
+    println!(" <<<  Overall score:  {:.01} / 10.0  >>>", overall);
 }
 
 fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
 
+    let mbps = ((opt.packets_per_second as u64) * opt.num_connections * (opt.packet_size as u64 + 40) * 2 * 8) as f64 / 1000.0 / 1000.0;
+    let traffic = mbps * (opt.duration as f64) / 9.0;
+
+    eprintln!(
+        "The test would do approx {:.3} Mbit/s and consume {:.3} megabytes of traffic",
+        mbps,
+        traffic,
+    );
+
+    if opt.only_calc {
+        return Ok(());
+    }
+
+    if mbps > 50.0 || traffic > 100.0 {
+        if !opt.force {
+            Err("Refusing to run test of that scale. Use --force to override.")?;
+        }
+    }
+
     let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let probing_udp = std::net::UdpSocket::bind(local_addr)?;
+    probing_udp.set_read_timeout(Some(Duration::from_millis(100)));
     let probing_udp = Arc::new(probing_udp);
     let time_base = Instant::now();
 
@@ -173,6 +345,7 @@ fn main() -> Result<(), Error> {
         let udp = tokio::net::UdpSocket::bind(&local_addr).expect("Can't bind UDP anymore");
         let mut c = turnclient::TurnClientBuilder::new(serv, user, passwd);
         c.max_retries = 30;
+        c.software = Some("TURN_Hammer");
         let (turnsink, turnstream) = c.build_and_send_request(udp).split();
 
         let srcevents = turnstream.map(|x|ServeTurnEventOrShutdown::TurnEvent(x))
@@ -228,8 +401,9 @@ fn main() -> Result<(), Error> {
             std::thread::spawn(move || {
                 receiving_thread(
                     probing_udp,
-                    duration,
-                    packet_size, 
+                    duration + delay_after_stopping_sender,
+                    packet_size,
+                    duration * (pps as u64) * k,
                     time_base,
                 );
             });
@@ -237,7 +411,7 @@ fn main() -> Result<(), Error> {
             tokio_timer::Delay::new(
                 Instant::now() + 
                 Duration::from_secs(
-                    duration + delay_after_stopping_sender
+                    duration + delay_after_stopping_sender + 1
                 )
             ).and_then(|()| {
                 // Phase 4: Stopping
