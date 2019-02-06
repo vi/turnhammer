@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 extern crate bytecodec;
 extern crate futures;
 extern crate rand;
@@ -16,19 +14,8 @@ use std::net::SocketAddr;
 use structopt::StructOpt;
 use std::sync::Arc;
 
-use futures::{Async, Future, Poll};
-use futures::{Stream, Sink};
-
-use std::net::ToSocketAddrs;
-use stun_codec::rfc5389;
-use stun_codec::{MessageDecoder, MessageEncoder};
-
-use bytecodec::{DecodeExt, EncodeExt};
-use stun_codec::rfc5389::attributes::{
-    MappedAddress, Software, XorMappedAddress, XorMappedAddress2,
-};
-use stun_codec::rfc5389::{methods::BINDING, Attribute};
-use stun_codec::{Message, MessageClass, TransactionId};
+use futures::{Future};
+use futures::{Stream};
 
 use tokio::sync::oneshot;
 
@@ -77,6 +64,14 @@ struct Opt {
     /// Override bandwidth or traffic limitation
     #[structopt(long="force", short="f")]
     force: bool,
+
+    /// Set pps to 90 and pktsize to 960
+    #[structopt(long="video")]
+    video_override: bool,
+
+    /// Set pps to 16 and pktsize to 192
+    #[structopt(long="audio")]
+    audio_override: bool,
 }
 
 enum ServeTurnEventOrShutdown {
@@ -244,7 +239,7 @@ fn receiving_thread(
         println!("Received no packets");
         return;
     }
-    let nn = (max_n - min_n + 1);
+    let nn = max_n - min_n + 1;
 
     print!(
         "Received {} packets from {} window of total {} || ",
@@ -283,7 +278,19 @@ fn receiving_thread(
 }
 
 fn main() -> Result<(), Error> {
-    let opt = Opt::from_args();
+    let mut opt = Opt::from_args();
+
+    if opt.audio_override && opt.video_override {
+        Err("Both --audio and --video is meaningless")?;
+    }
+    if opt.audio_override {
+        opt.packets_per_second = 16;
+        opt.packet_size = 192;
+    }
+    if opt.video_override {
+        opt.packets_per_second = 90;
+        opt.packet_size = 960;
+    }
 
     let mbps = ((opt.packets_per_second as u64) * opt.num_connections * (opt.packet_size as u64 + 40) * 2 * 8) as f64 / 1000.0 / 1000.0;
     let traffic = mbps * (opt.duration as f64) / 9.0;
@@ -306,7 +313,7 @@ fn main() -> Result<(), Error> {
 
     let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let probing_udp = std::net::UdpSocket::bind(local_addr)?;
-    probing_udp.set_read_timeout(Some(Duration::from_millis(100)));
+    probing_udp.set_read_timeout(Some(Duration::from_millis(100)))?;
     let probing_udp = Arc::new(probing_udp);
     let time_base = Instant::now();
 
@@ -332,7 +339,7 @@ fn main() -> Result<(), Error> {
         clientstream,
         Duration::from_micros(opt.delay_between_allocations),
     );
-    let clientstream = clientstream.map_err(|e|Error::from("Error throttling"));
+    let clientstream = clientstream.map_err(|_e|Error::from("Error throttling"));
 
     let clienthandles = clientstream.map(move |(serv, user, passwd)| {
         let (snd, rcv) = oneshot::channel::<SocketAddr>();
@@ -357,7 +364,7 @@ fn main() -> Result<(), Error> {
         let f = srcevents.map(move |x| {
             match x {
                 TurnEvent(AllocationGranted{relay_address, ..}) => {
-                    snd.take().expect("More than one AllocationGranted?").send(relay_address);
+                    let _ = snd.take().expect("More than one AllocationGranted?").send(relay_address);
                     MessageToTurnServer::AddPermission(extaddr, ChannelUsage::WithChannel)
                 },
                 TurnEvent(MessageFromTurnServer::RecvFrom(sa,data)) => {
@@ -418,7 +425,7 @@ fn main() -> Result<(), Error> {
 
                 eprintln!("Stopping TURN clients");
                 for sh in shutdown_handles {
-                    sh.send(());
+                    let _ = sh.send(());
                 }
                 futures::future::ok(())
             }).map_err(|_e|Error::from("Timer error"))
