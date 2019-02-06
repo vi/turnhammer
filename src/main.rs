@@ -264,7 +264,7 @@ fn receiving_thread(
     println!(
         "Loss: {:07.04}%   bad loss: {:07.04}%",
         loss,
-        badloss,
+        badl,
     );
     println!(
         "RTT4 brackets: 0-49ms: {:07.04}%   180-399ms: {:07.04}%  1000-1999ms: {:07.04}%",
@@ -278,7 +278,7 @@ fn receiving_thread(
         rtts3,
         rtts5,
     );
-    let overall = 10.0 - loss/10.0 - badl/5.0 - rtts2/70.0 - rtts3/40.0 - rtts4/30.0 - rtts5/20.0;
+    let overall = 10.0 - loss/3.0 - badl/1.0 - rtts2/200.0 - rtts3/80.0 - rtts4/40.0 - rtts5/20.0;
     println!(" <<<  Overall score:  {:.01} / 10.0  >>>", overall);
 }
 
