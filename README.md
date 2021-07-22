@@ -2,6 +2,11 @@
 
 There are pre-built versions on Github Releases
 
+## Note
+
+Currently it is based on old Tokio 0.1 and fails to build with modern rustc.
+Should work with rustc 1.34.2, but is expected to fail with 1.53.0.
+
 ## Usage
 
 ```
