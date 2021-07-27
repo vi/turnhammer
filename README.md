@@ -1,46 +1,32 @@
 # TURN_Hammer
 
+A tool to stress-test TURN (RFC 5766) servers and measure resulting packet loss and RTT.
+
 There are pre-built versions on Github Releases
-
-## Note
-
-Currently it is based on old Tokio 0.1 and fails to build with modern rustc.
-Should work with rustc 1.34.2, but is expected to fail with 1.53.0.
 
 ## Usage
 
 ```
-turnhammer 0.1.0
-Vitaly _Vi Shukela <vi0oss@gmail.com>
-A tool to stress-test TURN (RFC 5766) servers
+Usage: turnhammer <server> <username> <password> [-j <parallel-connections>] [-s <pkt-size>] [--pps <pps>] [-d <duration>] [--delay-after-stopping-sender <delay-after-stopping-sender>] [--delay-between-allocations <delay-between-allocations>] [--calc] [-f] [--video] [--audio] [-J] [-C]
 
-USAGE:
-    turnhammer [FLAGS] [OPTIONS] <server> <username> <password>
 
-FLAGS:
-        --audio      Set pps to 16 and pktsize to 192
-    -f, --force      Override bandwidth or traffic limitation
-    -h, --help       Prints help information
-        --calc       Don't actually run, only calculate bandwidth and traffic
-    -V, --version    Prints version information
-        --video      Set pps to 90 and pktsize to 960
-
-OPTIONS:
-        --delay-after-stopping-sender <delay_after_stopping_sender>
-            Seconds to wait and receive after stopping sender [default: 3]
-
-        --delay-between-allocations <delay_between_allocations>
-            Microseconds to wait between TURN allocations [default: 2000]
-
-    -d, --duration <duration>                                          Experiment duration, seconds [default: 5]
-    -j, --parallel-connections <num_connections>                       Number of simultaneous connections [default: 1]
-    -s, --pkt-size <packet_size>                                       Packet size [default: 100]
-        --pps <packets_per_second>                                     Packets per second [default: 5]
-
-ARGS:
-    <server>      TURN server address (hostname is not resolved)
-    <username>    Username for TURN authorization
-    <password>    Credential for TURN authorizaion
+Options:
+  -j, --parallel-connections
+                    number of simultaneous connections
+  -s, --pkt-size    packet size
+  --pps             packets per second
+  -d, --duration    experiment duration, seconds
+  --delay-after-stopping-sender
+                    seconds to wait and receive after stopping sender
+  --delay-between-allocations
+                    microseconds to wait between TURN allocations
+  --calc            don't actually run, only calculate bandwidth and traffic
+  -f, --force       override bandwidth or traffic limitation
+  --video           set pps to 90 and pktsize to 960
+  --audio           set pps to 16 and pktsize to 192
+  -J, --json        output as JSON instead of plain text
+  -C, --no-channels do not use chanels
+  --help            display usage information
 ```
 
 Output sample:
@@ -57,6 +43,18 @@ RTT4 brackets: 0-49ms: 00.0000%   180-399ms: 50.7474%  1000-1999ms: 00.0000%
 Stopping TURN clients
 ```
 
+JSON output sample:
+
+```
+$ turnhammer  -J --video -j 3 104.131.203.210:3478  u153   p1994421   2> /dev/null
+{"status":"ok"
+,"received_packets":1350 ,"min_max_window":1350 ,"sent_packets":1350
+,"loss":0 ,"bad_loss":0
+,"rtt4":{"0_49":0 ,"50_179":0 ,"180_399":100 ,"400_999":0 ,"1000_1999":0 ,"2000+":0}
+,"score":9.5
+}
+```
+
 ## Algorithm
 
 1. Create a UDP socket bound to `0.0.0.0:0`.
@@ -68,3 +66,7 @@ Stopping TURN clients
 7. Analyse replies from those "echo servers" and measure packet loss and round-trip times.
 
 ![diagram](dia.svg)
+
+## Old version
+
+There is old Tokio 0.1-based version of turnhammer, tagged `v0.1.0` that can be built with older Rust and may support more old systems. It should work with rustc 1.34.2.

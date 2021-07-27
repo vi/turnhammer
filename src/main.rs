@@ -25,7 +25,7 @@ unzip_n::unzip_n!(3);
 
 
 #[derive(Debug, argh::FromArgs)]
-/// A tool to test TURN server for performance and measure it's packet loss and RTT.
+/// A tool to stress-test TURN (RFC 5766) servers and measure resulting packet loss and RTT.
 struct Opt {
     /// TURN server address (hostname is not resolved)
     #[argh(positional)]
@@ -126,7 +126,7 @@ fn sending_thread(
         } else {
             delta = now - time_base;
         }
-        
+
         BE::write_u64(&mut buf[0..8], delta.as_secs());
         BE::write_u32(&mut buf[8..12], delta.subsec_nanos());
 
