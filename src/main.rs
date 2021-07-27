@@ -75,6 +75,9 @@ struct Opt {
     /// Set pps to 16 and pktsize to 192
     #[structopt(long="audio")]
     audio_override: bool,
+
+    #[structopt(long="json", short="J")]
+    json_mode: bool,
 }
 
 #[derive(Debug)]
@@ -130,6 +133,7 @@ fn receiving_thread(
     packet_size: usize,
     total_packets: u64,
     time_base: Instant,
+    json_mode: bool,
 ) {
     use std::collections::BinaryHeap;
     use byteorder::{BE,ByteOrder};
@@ -240,17 +244,32 @@ fn receiving_thread(
     drop(analyse_packet);
 
     if ctr == 0 {
-        println!("Received no packets");
+        if !json_mode {
+            println!("Received no packets");
+        } else {
+            println!("{}", r#"{"status":"no_packets_received"}"#);
+        }
         return;
     }
     let nn = max_n - min_n + 1;
 
-    print!(
-        "Received {} packets from {} window of total {} || ",
-        ctr,
-        nn,
-        total_packets,
-    );
+    if json_mode { println!("{}", r#"{"status":"ok""#); }
+
+    if !json_mode {
+        print!(
+            "Received {} packets from {} window of total {} || ",
+            ctr,
+            nn,
+            total_packets,
+        );
+    } else {
+        println!(
+            r#","received_packets":{} ,"min_max_window":{} ,"sent_packets":{}"#,
+            ctr,
+            nn,
+            total_packets,
+        )
+    }
     let nn = nn as f64;
     let loss = 100.0 - (ctr as f64) * 100.0 / nn;
     let badl = (badloss as f64) * 100.0 / nn;
@@ -260,25 +279,53 @@ fn receiving_thread(
     let rtts3 =(rtt4stats[3] as f64) * 100.0 / nn;
     let rtts4 =(rtt4stats[4] as f64) * 100.0 / nn;
     let rtts5 =(rtt4stats[5] as f64) * 100.0 / nn;
-    println!(
-        "Loss: {:07.04}%   bad loss: {:07.04}%",
-        loss,
-        badl,
-    );
-    println!(
-        "RTT4 brackets: 0-49ms: {:07.04}%   180-399ms: {:07.04}%  1000-1999ms: {:07.04}%",
-        rtts0,
-        rtts2,
-        rtts4,
-    );
-    println!(
-        "             50-179ms: {:07.04}%   500-999ms: {:07.04}%      2000+ms: {:07.04}%",
-        rtts1,
-        rtts3,
-        rtts5,
-    );
+    if !json_mode {
+        println!(
+            "Loss: {:07.04}%   bad loss: {:07.04}%",
+            loss,
+            badl,
+        );
+        println!(
+            "RTT4 brackets: 0-49ms: {:07.04}%   180-399ms: {:07.04}%  1000-1999ms: {:07.04}%",
+            rtts0,
+            rtts2,
+            rtts4,
+        );
+        println!(
+            "             50-179ms: {:07.04}%   400-999ms: {:07.04}%      2000+ms: {:07.04}%",
+            rtts1,
+            rtts3,
+            rtts5,
+        );
+    } else {
+        println!(
+            r#","loss":{} ,"bad_loss":{}"#,
+           loss,
+           badl,
+        );
+
+        println!(
+            r#","rtt4":{{"0_49":{} ,"50_179":{} ,"180_399":{} ,"400_999":{} ,"1000_1999":{} ,"2000+":{}}}"#,
+            rtts0,
+            rtts1,
+            rtts2,
+            rtts3,
+            rtts4,
+            rtts5,
+        );
+    }
     let overall = 10.0 - loss/3.0 - badl/1.0 - rtts2/200.0 - rtts3/80.0 - rtts4/40.0 - rtts5/20.0;
-    println!(" <<<  Overall score:  {:.01} / 10.0  >>>", overall);
+
+    if !json_mode {
+        println!(" <<<  Overall score:  {:.01} / 10.0  >>>", overall);
+    } else {
+        println!(
+            r#","score":{:.01}"#,
+            overall,
+        );
+    }
+
+    if json_mode { println!("{}", r#"}"#); }
 }
 
 #[tokio::main(flavor="current_thread")]
@@ -436,13 +483,15 @@ async fn main() -> Result<(), Error> {
             time_base,
         );
     });
-    std::thread::spawn(move || {
+    let json_mode = opt.json_mode;
+    let recvthread = std::thread::spawn(move || {
         receiving_thread(
             probing_udp,
             duration + delay_after_stopping_sender,
             packet_size,
             duration * (pps as u64) * (k as u64),
             time_base,
+            json_mode,
         );
     });
 
@@ -460,9 +509,15 @@ async fn main() -> Result<(), Error> {
         let _ = sh.send(());
     }
 
+    let _ = recvthread.join();
+
+    let shutdown_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
     for jh in join_handles {
-        if let Err(e) = jh.await {  
-            eprintln!("{}", e);
+        match tokio::time::timeout_at(shutdown_deadline, jh).await {
+            Ok(Ok(_)) => (),
+            Err(_) => (),
+            Ok(Err(e)) => eprintln!("{}", e),
         }
     }
 
