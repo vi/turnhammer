@@ -498,7 +498,9 @@ dependencies = [
 
 [[package]]
 name = "turnclient"
-version = "0.3.2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4381183dd6b9c2215c5e2b205d504ab0b27b5c331d73a9cb11f90de3a1ef959"
 dependencies = [
  "anyhow",
  "bytecodec",
