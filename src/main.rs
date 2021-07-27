@@ -82,6 +82,10 @@ struct Opt {
     /// output as JSON instead of plain text
     #[argh(switch, long="json", short='J')]
     json_mode: bool,
+
+    /// do not use chanels
+    #[argh(switch, long="no-channels", short='C')]
+    no_channels: bool,
 }
 
 #[derive(Debug)]
@@ -113,14 +117,18 @@ fn sending_thread(
     for i in 0..n {
         let deadline = start + step * i;
         let now = Instant::now();
-        let delta = now - time_base;
 
-        BE::write_u64(&mut buf[0..8], delta.as_secs());
-        BE::write_u32(&mut buf[8..12], delta.subsec_nanos());
+        let delta;
 
         if now < deadline {
+            delta = deadline - time_base;
             sleeper.sleep(deadline - now);
+        } else {
+            delta = now - time_base;
         }
+        
+        BE::write_u64(&mut buf[0..8], delta.as_secs());
+        BE::write_u32(&mut buf[8..12], delta.subsec_nanos());
 
         let udp = &*udp;
         for addr in &destinations {
@@ -407,6 +415,7 @@ async fn main() -> Result<(), Error> {
         Duration::from_micros(opt.delay_between_allocations),
     );
 
+    let no_channels = opt.no_channels;
     let clienthandles = FuturesStreamExt::then(clientstream, move |(serv, user, passwd)| { async move {
         let (snd, rcv) = oneshot::channel::<SocketAddr>();
         let (shutdown_handle, rcv2) = oneshot::channel::<()>(); // for shutdown
@@ -415,6 +424,7 @@ async fn main() -> Result<(), Error> {
         use turnclient::{MessageFromTurnServer,MessageToTurnServer,ChannelUsage};
 
         let udp = tokio::net::UdpSocket::bind(&local_addr).await.expect("Can't bind UDP anymore");
+        
         let mut c = turnclient::TurnClientBuilder::new(serv, user, passwd);
         c.max_retries = 30;
         c.software = Some("TURN_Hammer");
@@ -437,7 +447,12 @@ async fn main() -> Result<(), Error> {
                     } else {
                         relay_address_buf = Some(relay_address);
                     }
-                    MessageToTurnServer::AddPermission(extaddr, ChannelUsage::WithChannel)
+                    let chusage = if no_channels {
+                        ChannelUsage::JustPermission
+                    } else {
+                        ChannelUsage::WithChannel
+                    };
+                    MessageToTurnServer::AddPermission(extaddr, chusage)
                 },
                 TurnEvent(Ok(MessageFromTurnServer::RecvFrom(sa,data))) => {
                     //eprintln!("Incoming {} bytes from {}", data.len(), sa);
@@ -457,6 +472,9 @@ async fn main() -> Result<(), Error> {
                     }
                     MessageToTurnServer::Noop
                 },
+                TurnEvent(Ok(MessageFromTurnServer::PermissionNotCreated(sa))) => {
+                    anyhow::bail!("TURN server denied permission to access {}", sa);
+                }
                 Shutdown => {
                     MessageToTurnServer::Disconnect
                 },
