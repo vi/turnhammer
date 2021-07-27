@@ -1,7 +1,7 @@
 extern crate bytecodec;
 extern crate futures;
 extern crate rand;
-extern crate structopt;
+extern crate argh;
 extern crate stunclient;
 extern crate turnclient;
 extern crate tokio;
@@ -11,7 +11,6 @@ extern crate byteorder;
 use std::time::{Duration};
 use tokio::time::Instant;
 use std::net::SocketAddr;
-use structopt::StructOpt;
 use std::sync::Arc;
 
 use futures::{FutureExt};
@@ -25,58 +24,63 @@ type Error = anyhow::Error;
 unzip_n::unzip_n!(3);
 
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, argh::FromArgs)]
+/// A tool to test TURN server for performance and measure it's packet loss and RTT.
 struct Opt {
     /// TURN server address (hostname is not resolved)
+    #[argh(positional)]
     server: SocketAddr,
 
-    /// Username for TURN authorization
+    /// username for TURN authorization
+    #[argh(positional)]
     username: String,
 
-    /// Credential for TURN authorizaion
+    /// credential for TURN authorizaion
+    #[argh(positional)]
     password: String,
 
-    /// Number of simultaneous connections
-    #[structopt(short="-j", long="parallel-connections", default_value="1")]
+    /// number of simultaneous connections
+    #[argh(option, short='j', long="parallel-connections", default="1")]
     num_connections: usize,
 
-    /// Packet size
-    #[structopt(short="-s", long="pkt-size", default_value="100")]
+    /// packet size
+    #[argh(option, short='s', long="pkt-size", default="100")]
     packet_size: usize,
 
-    /// Packets per second
-    #[structopt(long="pps", default_value="5")]
+    /// packets per second
+    #[argh(option, long="pps", default="5")]
     packets_per_second: u32,
 
-    /// Experiment duration, seconds
-    #[structopt(short="d", long="duration", default_value="5")]
+    /// experiment duration, seconds
+    #[argh(option, short='d', long="duration", default="5")]
     duration: u64,
 
-    /// Seconds to wait and receive after stopping sender
-    #[structopt(long="delay-after-stopping-sender", default_value="3")]
+    /// seconds to wait and receive after stopping sender
+    #[argh(option, long="delay-after-stopping-sender", default="3")]
     delay_after_stopping_sender: u64,
 
-    /// Microseconds to wait between TURN allocations
-    #[structopt(long="delay-between-allocations", default_value="2000")]
+    /// microseconds to wait between TURN allocations
+    #[argh(option, long="delay-between-allocations", default="2000")]
     delay_between_allocations: u64,
 
-    /// Don't actually run, only calculate bandwidth and traffic
-    #[structopt(long="calc")]
+    /// don't actually run, only calculate bandwidth and traffic
+    #[argh(switch, long="calc")]
     only_calc: bool,
 
-    /// Override bandwidth or traffic limitation
-    #[structopt(long="force", short="f")]
+    /// override bandwidth or traffic limitation
+    #[argh(switch, long="force", short='f')]
     force: bool,
 
-    /// Set pps to 90 and pktsize to 960
-    #[structopt(long="video")]
+    /// set pps to 90 and pktsize to 960
+    #[argh(switch, long="video")]
     video_override: bool,
 
-    /// Set pps to 16 and pktsize to 192
-    #[structopt(long="audio")]
+    /// set pps to 16 and pktsize to 192
+    #[argh(switch, long="audio")]
     audio_override: bool,
 
-    #[structopt(long="json", short="J")]
+    /// output as JSON instead of plain text
+    #[argh(switch, long="json", short='J')]
     json_mode: bool,
 }
 
@@ -330,7 +334,7 @@ fn receiving_thread(
 
 #[tokio::main(flavor="current_thread")]
 async fn main() -> Result<(), Error> {
-    let mut opt = Opt::from_args();
+    let mut opt : Opt = argh::from_env();
 
     if opt.audio_override && opt.video_override {
         anyhow::bail!("Both --audio and --video is meaningless");
@@ -347,18 +351,30 @@ async fn main() -> Result<(), Error> {
     let mbps = ((opt.packets_per_second as u64) * (opt.num_connections as u64) * (opt.packet_size as u64 + 40) * 2 * 8) as f64 / 1000.0 / 1000.0;
     let traffic = mbps * (opt.duration as f64) / 9.0;
 
-    eprintln!(
-        "The test would do approx {:.3} Mbit/s and consume {:.3} megabytes of traffic",
-        mbps,
-        traffic,
-    );
+    if !(opt.json_mode && opt.only_calc) {
+        eprintln!(
+            "The test would do approx {:.3} Mbit/s and consume {:.3} megabytes of traffic",
+            mbps,
+            traffic,
+        );
+    }
 
     if opt.only_calc {
+        if opt.json_mode {
+            println!(
+                r#"{{"status":"calc", "kpbs":{:.0}, "bytes":{:.0}}}"#,
+                mbps * 1000.0,
+                traffic * 1000_000.0,
+            );
+        }
         return Ok(());
     }
 
     if mbps > 50.0 || traffic > 100.0 {
         if !opt.force {
+            if opt.json_mode {
+                println!("{}", r#"{"status":"refused"}"#);
+            }
             anyhow::bail!("Refusing to run test of that scale. Use --force to override.");
         }
     }
