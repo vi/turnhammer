@@ -6,20 +6,23 @@ extern crate stunclient;
 extern crate turnclient;
 extern crate tokio;
 extern crate spin_sleep;
-extern crate tokio_timer;
 extern crate byteorder;
 
-use std::time::{Duration,Instant};
+use std::time::{Duration};
+use tokio::time::Instant;
 use std::net::SocketAddr;
 use structopt::StructOpt;
 use std::sync::Arc;
 
-use futures::{Future};
-use futures::{Stream};
+use futures::{FutureExt};
+use futures::StreamExt as FuturesStreamExt;
 
 use tokio::sync::oneshot;
+use tokio_stream::StreamExt as TokioStreamExt;
 
-type Error = Box<dyn std::error::Error>;
+type Error = anyhow::Error;
+
+unzip_n::unzip_n!(3);
 
 
 #[derive(Debug, StructOpt)]
@@ -35,7 +38,7 @@ struct Opt {
 
     /// Number of simultaneous connections
     #[structopt(short="-j", long="parallel-connections", default_value="1")]
-    num_connections: u64,
+    num_connections: usize,
 
     /// Packet size
     #[structopt(short="-s", long="pkt-size", default_value="100")]
@@ -74,8 +77,9 @@ struct Opt {
     audio_override: bool,
 }
 
+#[derive(Debug)]
 enum ServeTurnEventOrShutdown {
-    TurnEvent(turnclient::MessageFromTurnServer),
+    TurnEvent(Result<turnclient::MessageFromTurnServer,turnclient::Error>),
     Shutdown,
 }
 
@@ -277,11 +281,12 @@ fn receiving_thread(
     println!(" <<<  Overall score:  {:.01} / 10.0  >>>", overall);
 }
 
-fn main() -> Result<(), Error> {
+#[tokio::main(flavor="current_thread")]
+async fn main() -> Result<(), Error> {
     let mut opt = Opt::from_args();
 
     if opt.audio_override && opt.video_override {
-        Err("Both --audio and --video is meaningless")?;
+        anyhow::bail!("Both --audio and --video is meaningless");
     }
     if opt.audio_override {
         opt.packets_per_second = 16;
@@ -292,7 +297,7 @@ fn main() -> Result<(), Error> {
         opt.packet_size = 960;
     }
 
-    let mbps = ((opt.packets_per_second as u64) * opt.num_connections * (opt.packet_size as u64 + 40) * 2 * 8) as f64 / 1000.0 / 1000.0;
+    let mbps = ((opt.packets_per_second as u64) * (opt.num_connections as u64) * (opt.packet_size as u64 + 40) * 2 * 8) as f64 / 1000.0 / 1000.0;
     let traffic = mbps * (opt.duration as f64) / 9.0;
 
     eprintln!(
@@ -307,7 +312,7 @@ fn main() -> Result<(), Error> {
 
     if mbps > 50.0 || traffic > 100.0 {
         if !opt.force {
-            Err("Refusing to run test of that scale. Use --force to override.")?;
+            anyhow::bail!("Refusing to run test of that scale. Use --force to override.");
         }
     }
 
@@ -331,110 +336,135 @@ fn main() -> Result<(), Error> {
     let packet_size = opt.packet_size;
     let pps = opt.packets_per_second;
 
-    let clientstream = futures::stream::repeat::<_,Error>(
+    let clientstream = futures::stream::repeat(
         (opt.server, opt.username, opt.password),
     );
-    let clientstream = clientstream.take(k);
-    let clientstream = tokio_timer::throttle::Throttle::new(
-        clientstream,
+    let clientstream = TokioStreamExt::take(clientstream,k);
+    let clientstream = TokioStreamExt::throttle(clientstream,
         Duration::from_micros(opt.delay_between_allocations),
     );
-    let clientstream = clientstream.map_err(|_e|Error::from("Error throttling"));
 
-    let clienthandles = clientstream.map(move |(serv, user, passwd)| {
+    let clienthandles = FuturesStreamExt::then(clientstream, move |(serv, user, passwd)| { async move {
         let (snd, rcv) = oneshot::channel::<SocketAddr>();
-        let (snd2, rcv2) = oneshot::channel::<()>(); // for shutdown
+        let (shutdown_handle, rcv2) = oneshot::channel::<()>(); // for shutdown
         let mut snd = Some(snd);
-        let rcv2 = rcv2.map_err(|_|Error::from("Oneshot error 2"));
 
         use turnclient::{MessageFromTurnServer,MessageToTurnServer,ChannelUsage};
 
-        let udp = tokio::net::UdpSocket::bind(&local_addr).expect("Can't bind UDP anymore");
+        let udp = tokio::net::UdpSocket::bind(&local_addr).await.expect("Can't bind UDP anymore");
         let mut c = turnclient::TurnClientBuilder::new(serv, user, passwd);
         c.max_retries = 30;
         c.software = Some("TURN_Hammer");
         let (turnsink, turnstream) = c.build_and_send_request(udp).split();
 
-        let srcevents = turnstream.map(|x|ServeTurnEventOrShutdown::TurnEvent(x))
-        .select(rcv2.into_stream().map(|()|ServeTurnEventOrShutdown::Shutdown));
+        let srcevents = futures::stream::select(TokioStreamExt::map(turnstream,|x|ServeTurnEventOrShutdown::TurnEvent(x))
+        ,TokioStreamExt::map(rcv2.into_stream(),|_|ServeTurnEventOrShutdown::Shutdown));
 
         use MessageFromTurnServer::*;
         use ServeTurnEventOrShutdown::*;
 
-        let f = srcevents.map(move |x| {
-            match x {
-                TurnEvent(AllocationGranted{relay_address, ..}) => {
-                    let _ = snd.take().expect("More than one AllocationGranted?").send(relay_address);
+        let mut relay_address_buf = None;
+
+        let f = TokioStreamExt::map(srcevents,move |x| {
+            //eprintln!("{:?}", x);
+            Ok(match x {
+                TurnEvent(Ok(AllocationGranted{relay_address, ..})) => {
+                    if relay_address_buf.is_some() {
+                        eprintln!("AllocationGranted happened one more time?");
+                    } else {
+                        relay_address_buf = Some(relay_address);
+                    }
                     MessageToTurnServer::AddPermission(extaddr, ChannelUsage::WithChannel)
                 },
-                TurnEvent(MessageFromTurnServer::RecvFrom(sa,data)) => {
+                TurnEvent(Ok(MessageFromTurnServer::RecvFrom(sa,data))) => {
                     //eprintln!("Incoming {} bytes from {}", data.len(), sa);
                     MessageToTurnServer::SendTo(sa, data)
+                },
+                TurnEvent(Ok(MessageFromTurnServer::PermissionCreated(sa))) => {
+                    if relay_address_buf.is_none() {
+                        anyhow::bail!("Strangely, a permission was granted even before the allocation");
+                    }
+                    if sa != extaddr {
+                        eprintln!("Strangely, granted permission is not the same as we requested it");
+                    } else {
+                        if let Some(s) = snd.take() {
+                            // signal that we can start + tell our related address
+                            let _ = s.send(relay_address_buf.unwrap());
+                        }
+                    }
+                    MessageToTurnServer::Noop
                 },
                 Shutdown => {
                     MessageToTurnServer::Disconnect
                 },
-                _ => MessageToTurnServer::Noop,
-            }
-        }).forward(turnsink)
-        .and_then(|(_turnstream,_turnsink)|{
-            futures::future::ok(())
-        })
-        .map_err(|e|eprintln!("{}", e));
-
-        tokio::runtime::current_thread::spawn(f);
-        (rcv, snd2)
-    });
-    let clienthandles = clienthandles.collect();
-    let clienthandles = clienthandles.and_then(move |x|{
-        let (init_handles, shutdown_handles) : (Vec<_>, Vec<_>) = x.into_iter().unzip();
-        futures::future::join_all(init_handles)
-        .map_err(|_e|Error::from("Oneshot error"))
-        .and_then(move |destinations| {
-            eprintln!("Allocated {} TURN clients", destinations.len());
-            // Phase 3: Starting sender and receiver
-
-            let probing_udp2 = probing_udp.clone();
-            std::thread::spawn(move || {
-                sending_thread(
-                    probing_udp2,
-                    packet_size,
-                    pps,
-                    duration,
-                    destinations,
-                    time_base,
-                );
-            });
-            std::thread::spawn(move || {
-                receiving_thread(
-                    probing_udp,
-                    duration + delay_after_stopping_sender,
-                    packet_size,
-                    duration * (pps as u64) * k,
-                    time_base,
-                );
-            });
-
-            tokio_timer::Delay::new(
-                Instant::now() + 
-                Duration::from_secs(
-                    duration + delay_after_stopping_sender + 1
-                )
-            ).and_then(|()| {
-                // Phase 4: Stopping
-
-                eprintln!("Stopping TURN clients");
-                for sh in shutdown_handles {
-                    let _ = sh.send(());
+                TurnEvent(Err(e)) => {
+                    eprintln!("{}", e);
+                    MessageToTurnServer::Noop
                 }
-                futures::future::ok(())
-            }).map_err(|_e|Error::from("Timer error"))
-        })
+                _ => MessageToTurnServer::Noop,
+            })
+        }).forward(turnsink);
+
+        let joinh = tokio::spawn(async move {
+            if let Err(e) = f.await {
+                let s = format!("{}", e);
+                if s != "TURN client received a shutdown request" {
+                    eprintln!("{}", e);
+                }
+            }
+        });
+        (rcv, shutdown_handle, joinh)
+    }});
+    let clienthandles : Vec<(tokio::sync::oneshot::Receiver<std::net::SocketAddr>, tokio::sync::oneshot::Sender<()>, _)> 
+        = FuturesStreamExt::collect(clienthandles).await;
+    let (init_handles, shutdown_handles, join_handles) : (Vec<_>, Vec<_>, Vec<_>) = clienthandles.into_iter().unzip_n_vec();
+    let destinations : Vec<Result<std::net::SocketAddr,_>> = futures::future::join_all(init_handles).await;
+    let destinations : Vec<std::net::SocketAddr> = destinations.into_iter().collect::<Result<_,_>>()?;
+  
+    eprintln!("Allocated {} TURN clients", destinations.len());
+
+    // Phase 3: Starting sender and receiver
+
+    let probing_udp2 = probing_udp.clone();
+    std::thread::spawn(move || {
+        sending_thread(
+            probing_udp2,
+            packet_size,
+            pps,
+            duration,
+            destinations,
+            time_base,
+        );
+    });
+    std::thread::spawn(move || {
+        receiving_thread(
+            probing_udp,
+            duration + delay_after_stopping_sender,
+            packet_size,
+            duration * (pps as u64) * (k as u64),
+            time_base,
+        );
     });
 
-    let f = clienthandles.map_err(|e|eprintln!("{}",e));
+    tokio::time::sleep_until(
+        Instant::now() + 
+        Duration::from_secs(
+            duration + delay_after_stopping_sender + 1
+        )
+    ).await;
 
-    tokio::runtime::current_thread::run(f);
+    // Phase 4: Stopping
+
+    eprintln!("Stopping TURN clients");
+    for sh in shutdown_handles {
+        let _ = sh.send(());
+    }
+
+    for jh in join_handles {
+        if let Err(e) = jh.await {  
+            eprintln!("{}", e);
+        }
+    }
 
     Ok(())
 }
