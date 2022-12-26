@@ -73,7 +73,7 @@ If you want to use turnhammer to measure maximum performance of your TURN server
 
 1. On a separate node (not in the system that hosts the TURN server itself) start a turnhammer instance and ensure lightweight load produces good score.
 2. Ramp up sinlge node's load until the score starts to drop.
-3. Assume that this level of load is a client (i.e. turnhammer's limitation) limitation. Roll back the load somewhat (e.g. by 30%), so that score is good again.
+3. Assume that this level of load is a client (i.e. turnhammer's) limitation. Roll back the load somewhat (e.g. by 30%), so that score is good again.
 4. Add more instances turnhammer (not within the same operating system, e.g. more VPS or physical nodes) and start them all simultaneously, with the same settings as "3.".
 5. As more and more turnhammer instances get simultaneously active, scores reported by individual turnhammer instances would eventually slump. This time assume it was caused by server overload (not client overload like in "2."). But if, for example, all turnhammer nodes were located in the same network segment then it can be still probing issue.
 
