@@ -67,6 +67,20 @@ $ turnhammer  -J --video -j 3 104.131.203.210:3478  u153   p1994421   2> /dev/nu
 
 ![diagram](dia.svg)
 
+## Stress testing guideline
+
+If you want to use turnhammer to measure maximum performance of your TURN server, approximately follow these steps:
+
+1. On a separate node (not in the system that hosts the TURN server itself) start a turnhammer instance and ensure lightweight load produces good score.
+2. Ramp up sinlge node's load until the score starts to drop.
+3. Assume that this level of load is a client (i.e. turnhammer's limitation) limitation. Roll back the load somewhat (e.g. by 30%), so that score is good again.
+4. Add more instances turnhammer (not within the same operating system, e.g. more VPS or physical nodes) and start them all simultaneously, with the same settings as "3.".
+5. As more and more turnhammer instances get simultaneously active, scores reported by individual turnhammer instances would eventually slump. This time assume it was caused by server overload (not client overload like in "2."). But if, for example, all turnhammer nodes were located in the same network segment then it can be still probing issue.
+
+Note that there are currently some bugs in score calculation - if you see unrealisting values and large negative scores then it is a bug in turnhammer. But that bug should not happen when TURN server connection is working well.
+
+Measuring CPU load may be helpful in the research, but do not get to 100% client or server CPU loads during tests. 
+
 ## Old version
 
 There is old Tokio 0.1-based version of turnhammer, tagged `v0.1.0` that can be built with older Rust and may support more old systems. It should work with rustc 1.34.2.
