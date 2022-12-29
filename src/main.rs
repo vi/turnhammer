@@ -478,6 +478,9 @@ async fn main() -> Result<(), Error> {
                 Shutdown => {
                     MessageToTurnServer::Disconnect
                 },
+                TurnEvent(Ok(RedirectedToAlternateServer(sa))) => {
+                    anyhow::bail!("TURN server redirected to alternate server address {}", sa);
+                },
                 TurnEvent(Err(e)) => {
                     eprintln!("{}", e);
                     MessageToTurnServer::Noop
